@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ func main() {
 	mongoDBURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	mongoDBDatabase := getEnv("MONGO_DATABASE", "node_logs")
 	logDir := getEnv("LOG_DIR", "./logs") // 从环境变量获取日志目录
+	mainLogName := getEnv("MAIN_LOG_NAME", "stdout-xx.txt")
 
 	log.Printf("数据库URI: %s", mongoDBURI)
 	log.Printf("数据库名: %s", mongoDBDatabase)
@@ -50,10 +52,10 @@ func main() {
 	db := client.Database(mongoDBDatabase)
 
 	// 1. 处理历史日志文件
-	processHistoricalLogs(logDir, db)
+	processHistoricalLogs(logDir, mainLogName, db)
 
 	// 2. 处理当前的主日志文件
-	mainLogFile := filepath.Join(logDir, "stdout-movad.txt")
+	mainLogFile := filepath.Join(logDir, mainLogName)
 	processSingleFile(mainLogFile, db)
 
 	// 3. 实时监听主日志文件
@@ -69,7 +71,7 @@ func getEnv(key, fallback string) string {
 }
 
 // processHistoricalLogs 查找并按顺序处理历史日志文件
-func processHistoricalLogs(logDir string, db *mongo.Database) {
+func processHistoricalLogs(logDir string, mainLogName string, db *mongo.Database) {
 	log.Println("开始处理历史日志文件...")
 	files, err := os.ReadDir(logDir)
 	if err != nil {
@@ -77,7 +79,7 @@ func processHistoricalLogs(logDir string, db *mongo.Database) {
 		return
 	}
 
-	re := regexp.MustCompile(`^stdout-movad\.txt\.(\d+)$`)
+	re := regexp.MustCompile(fmt.Sprintf(`^%s\.(\d+)$`, mainLogName))
 	var historicalLogs []string
 
 	for _, file := range files {
