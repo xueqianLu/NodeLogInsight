@@ -51,6 +51,9 @@ func main() {
 	log.Println("成功连接到 MongoDB!")
 	db := client.Database(mongoDBDatabase)
 
+	// 在处理任何日志之前，确保索引存在
+	ensureIndexes(db)
+
 	// 1. 处理历史日志文件
 	processHistoricalLogs(logDir, mainLogName, db)
 
@@ -235,7 +238,35 @@ func parseAndStore(line string, db *mongo.Database) {
 		collection := db.Collection("committed_state")
 		_, err := collection.InsertOne(context.Background(), entry)
 		if err != nil {
-			log.Printf("写入 committed_state 到 MongoDB 时出错: %v", err)
+			// 如果是重复键错误，则忽略，因为这意味着数据已经存在
+			if !mongo.IsDuplicateKeyError(err) {
+				log.Printf("写入 committed_state 到 MongoDB 时出错: %v", err)
+			}
 		}
 	}
+}
+
+// ensureIndexes 创建 MongoDB 唯一索引以防止数据重复
+func ensureIndexes(db *mongo.Database) {
+	log.Println("正在确保 MongoDB 索引存在...")
+
+	// 为 committed_state 创建唯一索引
+	committedStateCollection := db.Collection("committed_state")
+	_, err := committedStateCollection.Indexes().CreateOne(
+		context.Background(),
+		mongo.IndexModel{
+			Keys:    map[string]interface{}{"height": 1}, // 1 表示升序
+			Options: options.Index().SetUnique(true),
+		},
+	)
+	if err != nil {
+		log.Fatalf("为 committed_state 创建索引失败: %v", err)
+	}
+
+	// 您可以为其他集合也添加类似的索引
+	// 例如:
+	// executedBlockCollection := db.Collection("executed_block")
+	// _, err = executedBlockCollection.Indexes().CreateOne(...)
+
+	log.Println("MongoDB 索引已准备就绪。")
 }
