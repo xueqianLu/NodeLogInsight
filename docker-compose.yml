@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # Go 日志分析服务
+  log-analyzer:
+    # 使用当前目录下的 Dockerfile 进行构建
+    build: .
+    # 容器名称
+    container_name: node-log-analyzer
+    # 自动重启策略
+    restart: always
+    # 环境变量，用于配置应用
+    environment:
+      # MongoDB 的连接 URI，指向下面的 mongo 服务
+      - MONGO_URI=mongodb://mongo:27017
+      # MongoDB 数据库名称
+      - MONGO_DATABASE=node_logs
+      # 要监控的日志文件所在的目录
+      - LOG_DIR=/logs
+    # 卷挂载
+    volumes:
+      # 将宿主机的日志目录挂载到容器的 /logs 目录
+      # 请确保 ./logs 目录下包含了 stdout-movad.txt 以及 stdout-movad.txt.1 等文件
+      - ./logs:/logs:ro
+    # 依赖关系，确保在启动本服务前先启动 mongo 服务
+    depends_on:
+      - mongo
+
+  # MongoDB 服务
+  mongo:
+    # 使用官方的 MongoDB 镜像
+    image: mongo:latest
+    # 容器名称
+    container_name: mongodb
+    # 自动重启策略
+    restart: always
+    # 端口映射，将容器的 27017 端口映射到宿主机的 27017 端口
+    # 这样您就可以通过本地的 MongoDB 客户端连接到它
+    ports:
+      - "27017:27017"
+    # 卷挂载，用于持久化 MongoDB 的数据
+    # 数据将存储在宿主机的 ./mongo-data 目录下
+    volumes:
+      - ./mongo-data:/data/db
+
