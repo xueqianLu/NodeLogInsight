@@ -303,29 +303,124 @@ func ensureIndexes(db *mongo.Database) {
 
 	// 为 committed_state 创建唯一索引
 	committedStateCollection := db.Collection("committed_state")
-	_, err := committedStateCollection.Indexes().CreateOne(
-		context.Background(),
-		mongo.IndexModel{
-			Keys:    map[string]interface{}{"height": 1}, // 1 表示升序
-			Options: options.Index().SetUnique(true),
-		},
-	)
+	err := createUniqueIndex(committedStateCollection, "height", "committed_state")
 	if err != nil {
 		log.Fatalf("为 committed_state 创建索引失败: %v", err)
 	}
 
 	// 为 block_time_gap 创建唯一索引
 	blockTimeGapCollection := db.Collection("block_time_gap")
-	_, err = blockTimeGapCollection.Indexes().CreateOne(
-		context.Background(),
-		mongo.IndexModel{
-			Keys:    map[string]interface{}{"height": 1}, // 1 表示升序
-			Options: options.Index().SetUnique(true),
-		},
-	)
+	err = createUniqueIndex(blockTimeGapCollection, "height", "block_time_gap")
 	if err != nil {
 		log.Fatalf("为 block_time_gap 创建索引失败: %v", err)
 	}
 
 	log.Println("MongoDB 索引已准备就绪。")
+}
+
+// createUniqueIndex 创建唯一索引，如果遇到重复键错误则先清理重复数据
+func createUniqueIndex(collection *mongo.Collection, fieldName string, collectionName string) error {
+	ctx := context.Background()
+
+	// 尝试创建索引
+	_, err := collection.Indexes().CreateOne(
+		ctx,
+		mongo.IndexModel{
+			Keys:    map[string]interface{}{fieldName: 1},
+			Options: options.Index().SetUnique(true),
+		},
+	)
+
+	if err != nil {
+		// 检查是否是重复键错误
+		if strings.Contains(err.Error(), "E11000 duplicate key error") {
+			log.Printf("警告: 集合 %s 中存在重复的 %s 值，正在清理重复数据...", collectionName, fieldName)
+
+			// 删除重复数据，只保留每个 height 的第一条记录
+			err = removeDuplicates(collection, fieldName)
+			if err != nil {
+				return fmt.Errorf("清理重复数据失败: %v", err)
+			}
+
+			// 重新尝试创建索引
+			_, err = collection.Indexes().CreateOne(
+				ctx,
+				mongo.IndexModel{
+					Keys:    map[string]interface{}{fieldName: 1},
+					Options: options.Index().SetUnique(true),
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("清理后创建索引仍然失败: %v", err)
+			}
+			log.Printf("成功为 %s 创建唯一索引", collectionName)
+		} else if strings.Contains(err.Error(), "IndexOptionsConflict") || strings.Contains(err.Error(), "already exists") {
+			// 索引已存在，这是正常的
+			log.Printf("索引已存在于 %s 集合", collectionName)
+		} else {
+			return err
+		}
+	} else {
+		log.Printf("成功为 %s 创建唯一索引", collectionName)
+	}
+
+	return nil
+}
+
+// removeDuplicates 删除集合中的重复数据，只保留每个字段值的第一条记录
+func removeDuplicates(collection *mongo.Collection, fieldName string) error {
+	ctx := context.Background()
+
+	// 使用聚合管道找出重复的记录
+	pipeline := []interface{}{
+		map[string]interface{}{
+			"$group": map[string]interface{}{
+				"_id":   "$" + fieldName,
+				"ids":   map[string]interface{}{"$push": "$_id"},
+				"count": map[string]interface{}{"$sum": 1},
+			},
+		},
+		map[string]interface{}{
+			"$match": map[string]interface{}{
+				"count": map[string]interface{}{"$gt": 1},
+			},
+		},
+	}
+
+	cursor, err := collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close(ctx)
+
+	var duplicateCount int
+	for cursor.Next(ctx) {
+		var result struct {
+			ID    interface{}   `bson:"_id"`
+			IDs   []interface{} `bson:"ids"`
+			Count int           `bson:"count"`
+		}
+		if err := cursor.Decode(&result); err != nil {
+			continue
+		}
+
+		// 保留第一条，删除其余的
+		if len(result.IDs) > 1 {
+			idsToDelete := result.IDs[1:] // 跳过第一条
+			for _, id := range idsToDelete {
+				_, err := collection.DeleteOne(ctx, map[string]interface{}{"_id": id})
+				if err != nil {
+					log.Printf("删除重复记录失败: %v", err)
+				} else {
+					duplicateCount++
+				}
+			}
+		}
+	}
+
+	if duplicateCount > 0 {
+		log.Printf("已清理 %d 条重复记录", duplicateCount)
+	}
+
+	return nil
 }
