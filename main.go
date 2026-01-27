@@ -27,16 +27,30 @@ type CommittedState struct {
 	AppHash   string    `bson:"appHash"`
 }
 
+// BlockTimeGap 记录相邻区块提交时间间隔超过阈值的情况
+type BlockTimeGap struct {
+	Timestamp      time.Time `bson:"timestamp"`      // 当前区块的时间戳
+	Height         int64     `bson:"height"`         // 当前区块高度
+	Txs            int       `bson:"txs"`            // 当前区块交易数量
+	TimeDiff       float64   `bson:"timeDiff"`       // 与前一个区块的时间差（秒）
+	PreviousHeight int64     `bson:"previousHeight"` // 前一个区块高度
+}
+
+// 全局变量，用于跟踪上一次提交的状态
+var lastCommittedState *CommittedState
+
 func main() {
 	// 从环境变量获取配置
 	mongoDBURI := getEnv("MONGO_URI", "mongodb://localhost:27017")
 	mongoDBDatabase := getEnv("MONGO_DATABASE", "node_logs")
 	logDir := getEnv("LOG_DIR", "./logs") // 从环境变量获取日志目录
 	mainLogName := getEnv("MAIN_LOG_NAME", "stdout-xx.txt")
+	skipHistorical := getEnv("SKIP_HISTORICAL_LOGS", "false") == "true"
 
 	log.Printf("数据库URI: %s", mongoDBURI)
 	log.Printf("数据库名: %s", mongoDBDatabase)
 	log.Printf("日志目录: %s", logDir)
+	log.Printf("跳过历史日志: %v", skipHistorical)
 
 	// 连接到 MongoDB
 	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(mongoDBURI))
@@ -54,14 +68,19 @@ func main() {
 	// 在处理任何日志之前，确保索引存在
 	ensureIndexes(db)
 
-	// 1. 处理历史日志文件
-	processHistoricalLogs(logDir, mainLogName, db)
+	// 1. 处理历史日志文件（如果未设置跳过）
+	if !skipHistorical {
+		processHistoricalLogs(logDir, mainLogName, db)
 
-	// 2. 处理当前的主日志文件
-	mainLogFile := filepath.Join(logDir, mainLogName)
-	processSingleFile(mainLogFile, db)
+		// 2. 处理当前的主日志文件
+		mainLogFile := filepath.Join(logDir, mainLogName)
+		processSingleFile(mainLogFile, db)
+	} else {
+		log.Println("跳过历史日志处理，直接开始监听最新日志")
+	}
 
 	// 3. 实时监听主日志文件
+	mainLogFile := filepath.Join(logDir, mainLogName)
 	watchLogFile(mainLogFile, db)
 }
 
@@ -235,6 +254,8 @@ func parseAndStore(line string, db *mongo.Database) {
 			Txs:       txs,
 			AppHash:   strings.TrimSpace(matches[5]),
 		}
+
+		// 存储 committed_state
 		collection := db.Collection("committed_state")
 		_, err := collection.InsertOne(context.Background(), entry)
 		if err != nil {
@@ -243,6 +264,36 @@ func parseAndStore(line string, db *mongo.Database) {
 				log.Printf("写入 committed_state 到 MongoDB 时出错: %v", err)
 			}
 		}
+
+		// 检查与上一次提交的时间差
+		if lastCommittedState != nil {
+			timeDiff := entry.Timestamp.Sub(lastCommittedState.Timestamp).Seconds()
+
+			// 如果时间差大于等于5秒，记录到 block_time_gap 集合
+			if timeDiff >= 5.0 {
+				gapEntry := BlockTimeGap{
+					Timestamp:      entry.Timestamp,
+					Height:         entry.Height,
+					Txs:            entry.Txs,
+					TimeDiff:       timeDiff,
+					PreviousHeight: lastCommittedState.Height,
+				}
+
+				gapCollection := db.Collection("block_time_gap")
+				_, err := gapCollection.InsertOne(context.Background(), gapEntry)
+				if err != nil {
+					if !mongo.IsDuplicateKeyError(err) {
+						log.Printf("写入 block_time_gap 到 MongoDB 时出错: %v", err)
+					}
+				} else {
+					log.Printf("检测到时间间隔 %.2f 秒 (区块 %d -> %d, 交易数: %d)",
+						timeDiff, lastCommittedState.Height, entry.Height, entry.Txs)
+				}
+			}
+		}
+
+		// 更新最后一次提交的状态
+		lastCommittedState = &entry
 	}
 }
 
@@ -263,10 +314,18 @@ func ensureIndexes(db *mongo.Database) {
 		log.Fatalf("为 committed_state 创建索引失败: %v", err)
 	}
 
-	// 您可以为其他集合也添加类似的索引
-	// 例如:
-	// executedBlockCollection := db.Collection("executed_block")
-	// _, err = executedBlockCollection.Indexes().CreateOne(...)
+	// 为 block_time_gap 创建唯一索引
+	blockTimeGapCollection := db.Collection("block_time_gap")
+	_, err = blockTimeGapCollection.Indexes().CreateOne(
+		context.Background(),
+		mongo.IndexModel{
+			Keys:    map[string]interface{}{"height": 1}, // 1 表示升序
+			Options: options.Index().SetUnique(true),
+		},
+	)
+	if err != nil {
+		log.Fatalf("为 block_time_gap 创建索引失败: %v", err)
+	}
 
 	log.Println("MongoDB 索引已准备就绪。")
 }
