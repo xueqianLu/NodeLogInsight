@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -38,6 +39,8 @@ type BlockTimeGap struct {
 
 // 全局变量，用于跟踪上一次提交的状态
 var lastCommittedState *CommittedState
+
+const maxLogLineSize = 10 * 1024
 
 func main() {
 	// 从环境变量获取配置
@@ -136,12 +139,9 @@ func processSingleFile(filePath string, db *mongo.Database) {
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parseAndStore(scanner.Text(), db)
-	}
-
-	if err := scanner.Err(); err != nil {
+	if err := streamLines(file, maxLogLineSize, func(line string) {
+		parseAndStore(line, db)
+	}); err != nil {
 		log.Printf("读取日志文件 '%s' 时出错: %v", filePath, err)
 	}
 }
@@ -165,8 +165,7 @@ func watchLogFile(filePath string, db *mongo.Database) {
 			file = nil
 			return
 		}
-		// 移动到上次读取的位置
-		if _, err := file.Seek(currentPos, 0); err != nil {
+		if _, err := file.Seek(currentPos, io.SeekStart); err != nil {
 			log.Printf("移动文件指针失败: %v", err)
 		}
 	}
@@ -212,16 +211,12 @@ func watchLogFile(filePath string, db *mongo.Database) {
 						continue
 					}
 				}
-				scanner := bufio.NewScanner(file)
-				for scanner.Scan() {
-					parseAndStore(scanner.Text(), db)
-				}
-				if err := scanner.Err(); err != nil {
+				if err := streamLines(file, maxLogLineSize, func(line string) {
+					parseAndStore(line, db)
+				}); err != nil {
 					log.Printf("监视期间读取文件出错: %v", err)
 				}
-				// 更新当前位置
-				pos, err := file.Seek(0, os.SEEK_CUR)
-				if err == nil {
+				if pos, err := file.Seek(0, io.SeekCurrent); err == nil {
 					currentPos = pos
 				}
 			}
@@ -423,4 +418,55 @@ func removeDuplicates(collection *mongo.Collection, fieldName string) error {
 	}
 
 	return nil
+}
+
+func streamLines(r io.Reader, maxLineSize int, handle func(string)) error {
+	if maxLineSize <= 0 {
+		maxLineSize = 64 * 1024
+	}
+	reader := bufio.NewReaderSize(r, maxLineSize)
+
+	trimLine := func(b []byte) string {
+		return strings.TrimRight(string(b), "\r\n")
+	}
+
+	for {
+		segment, err := reader.ReadSlice('\n')
+		if err == nil {
+			handle(trimLine(segment))
+			continue
+		}
+
+		if err == bufio.ErrBufferFull {
+			log.Printf("检测到长度超过 %d 字节的日志行，已忽略", maxLineSize)
+			if derr := discardOversizedLine(reader); derr == io.EOF {
+				return nil
+			} else if derr != nil && derr != bufio.ErrBufferFull {
+				return derr
+			}
+			continue
+		}
+
+		if err == io.EOF {
+			if len(segment) > 0 {
+				handle(trimLine(segment))
+			}
+			return nil
+		}
+
+		return err
+	}
+}
+
+func discardOversizedLine(reader *bufio.Reader) error {
+	for {
+		_, err := reader.ReadSlice('\n')
+		if err == nil {
+			return nil
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return err
+	}
 }
